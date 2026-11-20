@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -u
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ENV_FILE="$ROOT/.env"
+declare -a usernames=() emails=()
+
+fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { printf 'Usage: git user [--add]\n' >&2; return 2; }
+
+valid_username() {
+  [[ ${#1} -le 39 && "$1" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ ]]
+}
+
+valid_email() {
+  [[ ${#1} -le 254 && "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]
+}
+
+load_profiles() {
+  local line key value count='' index username email username_key email_key
+  local -A values=()
+  usernames=()
+  emails=()
+
+  [[ ! -L "$ENV_FILE" ]] || fail "$ENV_FILE must be a regular file, not a symlink."
+  [[ -e "$ENV_FILE" ]] || return 0
+  [[ -f "$ENV_FILE" && -r "$ENV_FILE" ]] || fail "$ENV_FILE must be a readable file."
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == *=* ]] || fail "Invalid profile entry in $ENV_FILE."
+    key=${line%%=*}
+    value=${line#*=}
+    if [[ "$key" == GIT_USER_PROFILE_COUNT ]]; then
+      [[ -z "$count" ]] || fail "Duplicate profile count in $ENV_FILE."
+      count=$value
+    elif [[ "$key" =~ ^GIT_USER_PROFILE_([1-9][0-9]*)_(USERNAME|EMAIL)$ ]]; then
+      [[ -z ${values[$key]+present} ]] || fail "Duplicate profile field in $ENV_FILE: $key"
+      values[$key]=$value
+    else
+      fail "Unknown profile setting in $ENV_FILE: $key"
+    fi
+  done < "$ENV_FILE"
+
+  [[ "$count" =~ ^(0|[1-9][0-9]*)$ && ${#count} -le 4 ]] ||
+    fail "Missing or invalid GIT_USER_PROFILE_COUNT in $ENV_FILE."
+  (( count <= 1000 )) || fail "Too many profiles in $ENV_FILE."
+  for ((index = 1; index <= count; index++)); do
+    username_key="GIT_USER_PROFILE_${index}_USERNAME"
+    email_key="GIT_USER_PROFILE_${index}_EMAIL"
+    username=${values[$username_key]-}
+    email=${values[$email_key]-}
+    valid_username "$username" || fail "Invalid GitHub username at profile $index in $ENV_FILE."
+    valid_email "$email" || fail "Invalid Git email at profile $index in $ENV_FILE."
+    for value in "${usernames[@]}"; do
+      [[ ${value,,} != ${username,,} ]] || fail "Duplicate GitHub username in $ENV_FILE: $username"
+    done
+    usernames+=("$username")
+    emails+=("$email")
+  done
+  for key in "${!values[@]}"; do
+    [[ "$key" =~ ^GIT_USER_PROFILE_([1-9][0-9]*)_ ]] || continue
+    index=${BASH_REMATCH[1]}
+    (( 10#$index <= count )) || fail "Unexpected profile entry in $ENV_FILE: $key"
+  done
+}
+
+save_profiles() {
+  local temporary index
+  umask 077
+  temporary=$(mktemp "$ENV_FILE.XXXXXXXX") || fail "Could not create a profile file beside $ENV_FILE."
+  {
+    printf '# Local Git identities; managed by git user --add.\n'
+    printf 'GIT_USER_PROFILE_COUNT=%d\n' "${#usernames[@]}"
+    for ((index = 0; index < ${#usernames[@]}; index++)); do
+      printf 'GIT_USER_PROFILE_%d_USERNAME=%s\n' "$((index + 1))" "${usernames[index]}"
+      printf 'GIT_USER_PROFILE_%d_EMAIL=%s\n' "$((index + 1))" "${emails[index]}"
+    done
+  } > "$temporary" || { rm -f -- "$temporary"; fail 'Could not write the profile file.'; }
+  chmod 600 "$temporary" || { rm -f -- "$temporary"; fail 'Could not protect the profile file.'; }
+  mv -f -- "$temporary" "$ENV_FILE" || { rm -f -- "$temporary"; fail 'Could not save the profile file.'; }
+}
+
+has_account() {
+  local status=$1 expected=${2,,} line account
+  while IFS= read -r line; do
+    [[ "$line" == *'Logged in to github.com account '* ]] || continue
+    account=${line#*'Logged in to github.com account '}
+    account=${account%% *}
+    [[ ${account,,} == "$expected" ]] && return 0
+  done <<< "$status"
+  return 1
+}
+
+active_account() {
+  local status line account
+  status=$(gh auth status --active 2>&1) || true
+  while IFS= read -r line; do
+    [[ "$line" == *'Logged in to github.com account '* ]] || continue
+    account=${line#*'Logged in to github.com account '}
+    printf '%s\n' "${account%% *}"
+    return 0
+  done <<< "$status"
+  return 1
+}
+
+restore_active_account() {
+  local previous=$1 current
+  [[ -n "$previous" ]] || return 0
+  current=$(active_account || true)
+  [[ ${current,,} == ${previous,,} ]] && return 0
+  if ! gh auth switch --user "$previous"; then
+    printf 'error: could not restore GitHub account %s; check the active account.\n' "$previous" >&2
+    return 1
+  fi
+}
+
+authenticate_account() {
+  local username=$1 previous=$2 status
+  status=$(gh auth status 2>&1) || true
+  has_account "$status" "$username" && return 0
+
+  printf 'Please authenticate GitHub account %s in the browser.\n' "$username"
+  if ! gh auth login --web --clipboard; then
+    restore_active_account "$previous" || true
+    printf 'error: GitHub login failed or was cancelled.\n' >&2
+    return 1
+  fi
+  status=$(gh auth status 2>&1) || true
+  if ! has_account "$status" "$username"; then
+    restore_active_account "$previous" || true
+    printf 'error: GitHub login did not authenticate %s.\n' "$username" >&2
+    return 1
+  fi
+}
+
+add_profile() {
+  local username email previous existing
+  command -v gh >/dev/null 2>&1 || fail 'gh CLI is not installed.'
+  load_profiles || return 1
+  IFS= read -r -p 'GitHub username: ' username || fail 'Could not read GitHub username.'
+  IFS= read -r -p 'Git email: ' email || fail 'Could not read Git email.'
+  valid_username "$username" || fail 'Use a GitHub username containing letters, digits, and single hyphens.'
+  valid_email "$email" || fail 'Enter a valid Git email without spaces.'
+  for existing in "${usernames[@]}"; do
+    [[ ${existing,,} != ${username,,} ]] || fail "Profile already exists for $existing."
+  done
+
+  previous=$(active_account || true)
+  authenticate_account "$username" "$previous" || return 1
+  restore_active_account "$previous" || return 1
+  usernames+=("$username")
+  emails+=("$email")
+  save_profiles || return 1
+  printf 'Added %s (%s).\n' "$username" "$email"
+}
+
+switch_profile() {
+  local status active target target_email index previous
+  local -a choose_args
+  command -v gh >/dev/null 2>&1 || fail 'gh CLI is not installed.'
+  command -v gum >/dev/null 2>&1 || fail 'gum is not installed.'
+  load_profiles || return 1
+  (( ${#usernames[@]} > 0 )) || fail 'No Git users are configured. Add one with `git user --add`.'
+
+  status=$(gh auth status 2>&1) || true
+  active=$(active_account || true)
+  choose_args=(--limit 1 --header 'Select GitHub account:')
+  for target in "${usernames[@]}"; do
+    if [[ ${target,,} == ${active,,} ]]; then
+      choose_args+=(--selected "$target")
+      break
+    fi
+  done
+  target=$(gum choose "${choose_args[@]}" "${usernames[@]}") || return 0
+
+  target_email=''
+  for ((index = 0; index < ${#usernames[@]}; index++)); do
+    if [[ "${usernames[index]}" == "$target" ]]; then
+      target_email=${emails[index]}
+      break
+    fi
+  done
+  [[ -n "$target_email" ]] || fail 'Gum returned an unrecognized GitHub account.'
+
+  previous=$(active_account || true)
+  if ! has_account "$status" "$target"; then
+    authenticate_account "$target" "$previous" || return 1
+  fi
+  if ! gh auth switch --user "$target"; then
+    restore_active_account "$previous" || true
+    printf 'error: failed to switch active GitHub account to %s.\n' "$target" >&2
+    return 1
+  fi
+  if ! git config --global user.email "$target_email"; then
+    printf 'error: failed to update the global Git email.\n' >&2
+    restore_active_account "$previous" || true
+    return 1
+  fi
+  printf 'Switched to %s (%s).\n' "$target" "$target_email"
+}
+
+main() {
+  case "${1:-}" in
+    '') [[ $# -eq 0 ]] || { usage; return $?; }; switch_profile ;;
+    --add) [[ $# -eq 1 ]] || { usage; return $?; }; add_profile ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
